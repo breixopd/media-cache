@@ -1,0 +1,24 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommits"],
+  "timezone": "Europe/Madrid",
+  "schedule": ["before 6am on Monday"],
+  "labels": ["dependencies"],
+  "lockFileMaintenance": {"enabled": true},
+  "packageRules": [
+    {
+      "description": "Automerge low-risk updates after required checks",
+      "matchManagers": ["pep621", "dockerfile", "github-actions"],
+      "matchUpdateTypes": ["patch", "digest", "pin"],
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Require explicit approval for major updates",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

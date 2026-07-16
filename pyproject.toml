@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "homelab-media-cache"
+version = "1.0.0"
+description = "Playback-aware cache promotion and storage tiering service"
+readme = "README.md"
+license = "AGPL-3.0-only"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "APScheduler==3.11.3",
+    "Flask==3.1.3",
+    "gunicorn==26.0.0",
+    "requests==2.34.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pip-audit==2.10.1",
+    "pytest==9.1.1",
+    "pytest-cov==7.0.0",
+    "ruff==0.15.22",
+]
+
+[tool.setuptools]
+py-modules = ["app"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+omit = ["tests/*"]
