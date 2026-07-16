@@ -38,12 +38,47 @@ def client():
 
 class TestHealth:
     def test_health_ok(self, client):
-        resp = client.get("/health")
+        with patch.object(cache_app, "MEDIA_CACHE_TOKEN", "configured"):
+            resp = client.get("/health")
         assert resp.status_code == 200
         assert resp.json["status"] == "ok"
 
+    def test_health_fails_closed_without_admin_token(self, client):
+        with patch.object(cache_app, "MEDIA_CACHE_TOKEN", ""):
+            resp = client.get("/health")
+
+        assert resp.status_code == 503
+        assert resp.json["status"] == "misconfigured"
+
+    def test_responses_set_security_headers(self, client):
+        with patch.object(cache_app, "MEDIA_CACHE_TOKEN", "configured"):
+            resp = client.get("/health")
+
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert resp.headers["X-Frame-Options"] == "DENY"
+        assert resp.headers["Referrer-Policy"] == "no-referrer"
+
+    def test_oversized_payload_is_rejected(self, client):
+        resp = client.post(
+            "/webhook/jellyfin",
+            data=b"x" * (cache_app.MAX_REQUEST_BYTES + 1),
+            content_type="application/json",
+        )
+
+        assert resp.status_code == 413
+
 
 class TestCacheStatus:
+    def test_invalid_numeric_environment_uses_safe_defaults(self):
+        with patch.dict(cache_app.os.environ, {"TEST_VALUE": "invalid"}):
+            assert cache_app._env_int("TEST_VALUE", 42, minimum=1) == 42
+            assert cache_app._env_float("TEST_VALUE", 1.5, minimum=0.1) == 1.5
+
+    def test_out_of_range_numeric_environment_uses_safe_defaults(self):
+        with patch.dict(cache_app.os.environ, {"TEST_VALUE": "0"}):
+            assert cache_app._env_int("TEST_VALUE", 42, minimum=1) == 42
+            assert cache_app._env_float("TEST_VALUE", 1.5, minimum=0.1) == 1.5
+
     @patch.object(cache_app, "_detect_link_speed_mbps", return_value=None)
     def test_status_returns_metrics(self, mock_link, client):
         resp = client.get("/api/status")
@@ -81,6 +116,12 @@ class TestLibraryPaths:
 
 
 class TestJellyfinWebhook:
+    def test_rejects_non_object_payload(self, client):
+        resp = client.post("/webhook/jellyfin", json=["not", "an", "object"])
+
+        assert resp.status_code == 400
+        assert resp.json == {"error": "request body must be an object"}
+
     def test_ignores_non_playback(self, client):
         resp = client.post(
             "/webhook/jellyfin",
@@ -125,6 +166,27 @@ class TestPlexWebhook:
     def test_handles_bad_json(self, client):
         resp = client.post("/webhook/plex", data={"payload": "not json"})
         assert resp.json["status"] == "bad json"
+
+    def test_rejects_malformed_episode_indices(self, client):
+        resp = client.post(
+            "/webhook/plex",
+            data={
+                "payload": json.dumps(
+                    {
+                        "event": "media.play",
+                        "Metadata": {
+                            "type": "episode",
+                            "grandparentTitle": "Test Show",
+                            "parentIndex": "not-a-number",
+                            "index": "2",
+                        },
+                    }
+                )
+            },
+        )
+
+        assert resp.status_code == 400
+        assert resp.json == {"error": "invalid episode metadata"}
 
     @patch.object(cache_app, "_radarr_get")
     @patch.object(cache_app, "_resolve_sonarr_series")
@@ -229,6 +291,53 @@ class TestBackendsAPI:
             )
         assert resp.status_code == 400
 
+    @pytest.mark.parametrize("params", [["not", "an", "object"], "provider=AWS", None])
+    def test_add_backend_requires_parameter_object(self, client, params):
+        with patch.object(cache_app, "MEDIA_CACHE_TOKEN", "test-token"):
+            resp = client.post(
+                "/api/backends/add",
+                json={"name": "test-remote", "type": "s3", "params": params},
+                headers={"X-Media-Cache-Token": "test-token"},
+            )
+
+        assert resp.status_code == 400
+        assert resp.json == {"error": "params must be an object"}
+
+    def test_add_backend_rejects_unbounded_parameters(self, client):
+        params = {f"key_{index}": "value" for index in range(cache_app.MAX_BACKEND_PARAMS + 1)}
+        with patch.object(cache_app, "MEDIA_CACHE_TOKEN", "test-token"):
+            resp = client.post(
+                "/api/backends/add",
+                json={"name": "test-remote", "type": "s3", "params": params},
+                headers={"X-Media-Cache-Token": "test-token"},
+            )
+
+        assert resp.status_code == 400
+
+    def test_add_backend_rejects_nested_parameter_values(self, client):
+        with patch.object(cache_app, "MEDIA_CACHE_TOKEN", "test-token"):
+            resp = client.post(
+                "/api/backends/add",
+                json={"name": "test-remote", "type": "s3", "params": {"provider": {"nested": "value"}}},
+                headers={"X-Media-Cache-Token": "test-token"},
+            )
+
+        assert resp.status_code == 400
+
+    @patch("subprocess.run")
+    def test_add_backend_hides_rclone_errors(self, mock_run, client):
+        mock_run.return_value = MagicMock(returncode=1, stderr="secret_access_key=leaked")
+        with patch.object(cache_app, "MEDIA_CACHE_TOKEN", "test-token"):
+            resp = client.post(
+                "/api/backends/add",
+                json={"name": "test-remote", "type": "s3", "params": {"provider": "AWS"}},
+                headers={"X-Media-Cache-Token": "test-token"},
+            )
+
+        assert resp.status_code == 502
+        assert resp.json == {"error": "rclone rejected the backend configuration"}
+        assert b"leaked" not in resp.data
+
 
 class TestWatchState:
     def test_touch_tracked(self, client):
@@ -237,6 +346,15 @@ class TestWatchState:
         resp = client.get("/api/watch-state")
         assert resp.json["files"] >= 1
         assert "/library/test/file.mkv" in resp.json["state"]
+
+    def test_load_state_discards_invalid_shape(self, tmp_path):
+        state_file = tmp_path / "state.json"
+        state_file.write_text('["not", "a", "mapping"]')
+
+        with patch.object(cache_app, "STATE_FILE", str(state_file)):
+            cache_app._load_state()
+
+        assert cache_app._watch_state == {}
 
 
 class TestEviction:
@@ -258,3 +376,49 @@ class TestEviction:
         ):
             cache_app._eviction_check()
         assert "/gone.mkv" not in cache_app._watch_state
+
+    def test_eviction_discards_invalid_timestamp(self):
+        cache_app._watch_state = {
+            "/library/broken.mkv": {"last_watched": "not-a-date", "pinned": False},
+        }
+        with patch.object(cache_app, "_save_state"):
+            cache_app._eviction_check()
+
+        assert "/library/broken.mkv" not in cache_app._watch_state
+
+
+class TestPrefetchCoordination:
+    def test_background_prefetch_reserves_work_before_submission(self):
+        cache_app._prefetch_active.clear()
+        pool = MagicMock()
+        with (
+            patch.object(cache_app, "_translate_to_library", return_value="/library/episode.mkv"),
+            patch.object(cache_app, "_touch_watched"),
+            patch.object(cache_app, "_prefetch_pool", pool),
+        ):
+            cache_app._prefetch_paths_background(["/data/episode.mkv"])
+            cache_app._prefetch_paths_background(["/data/episode.mkv"])
+
+        pool.submit.assert_called_once_with(
+            cache_app._prefetch_full_file,
+            "/library/episode.mkv",
+            True,
+        )
+
+
+def test_scheduler_prevents_overlapping_eviction_jobs():
+    scheduler = MagicMock()
+    with patch.object(cache_app, "BackgroundScheduler", return_value=scheduler):
+        cache_app._start_scheduler()
+
+    scheduler.add_job.assert_called_once_with(
+        cache_app._eviction_check,
+        "interval",
+        hours=6,
+        id="eviction",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    scheduler.start.assert_called_once()

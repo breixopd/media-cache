@@ -13,6 +13,7 @@ Workflow:
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import subprocess  # nosec B404
@@ -30,6 +31,10 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 log = logging.getLogger("media-cache")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+MAX_REQUEST_BYTES = 1024 * 1024
+MAX_BACKEND_PARAMS = 32
+MAX_BACKEND_PARAM_VALUE_LENGTH = 4096
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
 
 # Shared-secret guard for mutating/admin endpoints. The backend-add endpoint accepts
 # rclone credentials, so a missing token is a service configuration error rather than
@@ -59,7 +64,42 @@ def _require_admin_token():
     return None
 
 
+@app.after_request
+def _set_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 # --- Config ---
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log.warning("%s must be an integer; using default %d", name, default)
+        return default
+    if value < minimum:
+        log.warning("%s must be at least %d; using default %d", name, minimum, default)
+        return default
+    return value
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        log.warning("%s must be numeric; using default %.2f", name, default)
+        return default
+    if not math.isfinite(value) or value < minimum:
+        log.warning("%s must be finite and at least %.2f; using default %.2f", name, minimum, default)
+        return default
+    return value
+
+
 SONARR_URL = os.getenv("SONARR_URL", "http://sonarr:8989")
 SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
 RADARR_URL = os.getenv("RADARR_URL", "http://radarr:7878")
@@ -68,18 +108,18 @@ JELLYFIN_URL = os.getenv("JELLYFIN_URL", "http://jellyfin:8096")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "")
 CACHE_DIR = os.getenv("CACHE_DIR", "/cache")
 LIBRARY_DIR = os.getenv("LIBRARY_DIR", "/library")
-CACHE_MAX_GB = int(os.getenv("CACHE_MAX_GB", "500"))
-COLD_AFTER_DAYS = int(os.getenv("COLD_AFTER_DAYS", "15"))
+CACHE_MAX_GB = _env_int("CACHE_MAX_GB", 500, minimum=1)
+COLD_AFTER_DAYS = _env_int("COLD_AFTER_DAYS", 15, minimum=1)
 RCLONE_REMOTE = os.getenv("RCLONE_REMOTE", "media-union")
 STATE_FILE = os.getenv("STATE_FILE", "/state/watch_state.json")
-UPLINK_MBPS = int(os.getenv("UPLINK_MBPS", "0"))
+UPLINK_MBPS = _env_int("UPLINK_MBPS", 0, minimum=0)
 THROUGHPUT_STATE_FILE = os.getenv("THROUGHPUT_STATE_FILE", "/state/throughput_samples.json")
 DEFAULT_UPLINK_MBPS = 500
 PREFETCH_SAMPLE_LIMIT = 25
-AVG_EPISODE_SIZE_GB = float(os.getenv("AVG_EPISODE_SIZE_GB", "1.5"))
-AVG_MOVIE_SIZE_GB = float(os.getenv("AVG_MOVIE_SIZE_GB", "8.0"))
-STREAM_4K_MBPS = int(os.getenv("STREAM_4K_MBPS", "25"))
-STREAM_1080P_MBPS = int(os.getenv("STREAM_1080P_MBPS", "10"))
+AVG_EPISODE_SIZE_GB = _env_float("AVG_EPISODE_SIZE_GB", 1.5, minimum=0.01)
+AVG_MOVIE_SIZE_GB = _env_float("AVG_MOVIE_SIZE_GB", 8.0, minimum=0.01)
+STREAM_4K_MBPS = _env_int("STREAM_4K_MBPS", 25, minimum=1)
+STREAM_1080P_MBPS = _env_int("STREAM_1080P_MBPS", 10, minimum=1)
 
 
 # Paths arrive from Sonarr/Radarr (/data/tv, /data/movies), Jellyfin (/data/media/*)
@@ -120,6 +160,8 @@ _watch_state: dict[str, dict] = {}
 _throughput_samples: list[dict[str, float | str]] = []
 _prefetch_active: set[str] = set()
 _prefetch_pool = ThreadPoolExecutor(max_workers=4)
+_prefetch_lock = threading.Lock()
+_metrics_lock = threading.Lock()
 
 _metrics_webhooks_total = 0
 _metrics_prefetch_started = 0
@@ -127,12 +169,31 @@ _metrics_prefetch_completed = 0
 _metrics_evictions_total = 0
 
 
+def _claim_prefetch(path: str) -> bool:
+    global _metrics_prefetch_started
+    with _prefetch_lock:
+        if path in _prefetch_active:
+            return False
+        _prefetch_active.add(path)
+    with _metrics_lock:
+        _metrics_prefetch_started += 1
+    return True
+
+
+def _release_prefetch(path: str) -> None:
+    with _prefetch_lock:
+        _prefetch_active.discard(path)
+
+
 def _load_state() -> None:
     global _watch_state
     try:
         with open(STATE_FILE) as f:
-            _watch_state = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise ValueError("watch state must be an object")
+        _watch_state = {path: state for path, state in raw.items() if isinstance(path, str) and isinstance(state, dict)}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
         _watch_state = {}
 
 
@@ -150,11 +211,18 @@ def _load_throughput_samples() -> None:
         with open(THROUGHPUT_STATE_FILE) as f:
             raw = json.load(f)
         if isinstance(raw, list):
-            samples = [sample for sample in raw if isinstance(sample, dict)]
+            samples = [
+                sample
+                for sample in raw
+                if isinstance(sample, dict)
+                and isinstance(sample.get("mbps"), int | float)
+                and isinstance(sample.get("type"), str)
+                and isinstance(sample.get("timestamp"), str)
+            ]
             _throughput_samples = samples[-PREFETCH_SAMPLE_LIMIT:]
         else:
             _throughput_samples = []
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         _throughput_samples = []
 
 
@@ -318,17 +386,19 @@ def _get_remaining_season_paths(series_id, season, from_episode):
 HEAD_BYTES = 100 * 1024 * 1024  # 100MB — enough for media server to start buffering
 
 
-def _prefetch_full_file(path):
+def _prefetch_full_file(path, claimed=False):
     """Read the entire file to pull it into rclone VFS cache."""
-    global _metrics_prefetch_started, _metrics_prefetch_completed
+    global _metrics_prefetch_completed
     path = _translate_to_library(path)
-    if path in _prefetch_active:
+    if not path:
         return
     if not os.path.exists(path):
         log.info("prefetch skip (not found): %s", path)
+        if claimed:
+            _release_prefetch(path)
         return
-    _prefetch_active.add(path)
-    _metrics_prefetch_started += 1
+    if not claimed and not _claim_prefetch(path):
+        return
     started = perf_counter()
     try:
         size = os.path.getsize(path)
@@ -339,12 +409,13 @@ def _prefetch_full_file(path):
                 pass
         _record_throughput(size, perf_counter() - started, "full")
         _touch_watched(path)
-        _metrics_prefetch_completed += 1
+        with _metrics_lock:
+            _metrics_prefetch_completed += 1
         log.info("prefetched: %s", Path(path).name)
     except Exception as e:
         log.warning("prefetch failed: %s — %s", path, e)
     finally:
-        _prefetch_active.discard(path)
+        _release_prefetch(path)
 
 
 def _prefetch_priority_file(path):
@@ -354,12 +425,13 @@ def _prefetch_priority_file(path):
     can start playing while the remainder downloads.
     """
     path = _translate_to_library(path)
+    if not path:
+        return False
     if not os.path.exists(path):
         log.info("priority prefetch skip: %s", path)
         return False
-    global _metrics_prefetch_started
-    _prefetch_active.add(path)
-    _metrics_prefetch_started += 1
+    if not _claim_prefetch(path):
+        return False
     started = perf_counter()
     try:
         size = os.path.getsize(path)
@@ -387,7 +459,7 @@ def _prefetch_priority_file(path):
         return True
     except Exception as e:
         log.warning("priority prefetch failed: %s — %s", path, e)
-        _prefetch_active.discard(path)
+        _release_prefetch(path)
         return False
 
 
@@ -409,16 +481,21 @@ def _prefetch_tail(path, offset):
     except Exception as e:
         log.warning("tail prefetch failed: %s — %s", path, e)
     finally:
-        _prefetch_active.discard(path)
+        _release_prefetch(path)
 
 
 def _prefetch_paths_background(paths):
     """Prefetch a list of paths in background (bounded concurrency)."""
     for p in paths:
-        if p in _prefetch_active:
+        path = _translate_to_library(p)
+        if not path or not _claim_prefetch(path):
             continue
-        _touch_watched(p)
-        _prefetch_pool.submit(_prefetch_full_file, p)
+        _touch_watched(path)
+        try:
+            _prefetch_pool.submit(_prefetch_full_file, path, True)
+        except RuntimeError:
+            _release_prefetch(path)
+            log.exception("prefetch queue rejected %s", path)
 
 
 def _resolve_sonarr_series(title):
@@ -440,15 +517,25 @@ def _eviction_check():
     """Move unwatched content to remote storage."""
     cutoff = datetime.now(UTC) - timedelta(days=COLD_AFTER_DAYS)
     to_evict = []
+    invalid_paths = []
     with _lock:
         for path, state in list(_watch_state.items()):
+            if not isinstance(state, dict):
+                invalid_paths.append(path)
+                continue
             if state.get("pinned"):
                 continue
-            last = datetime.fromisoformat(state.get("last_watched", "2000-01-01"))
+            try:
+                last = datetime.fromisoformat(str(state.get("last_watched", "2000-01-01")))
+            except ValueError:
+                invalid_paths.append(path)
+                continue
             if last.tzinfo is None:
                 last = last.replace(tzinfo=UTC)
             if last < cutoff:
                 to_evict.append(path)
+        for path in invalid_paths:
+            _watch_state.pop(path, None)
 
     global _metrics_evictions_total
     for path in to_evict:
@@ -463,7 +550,8 @@ def _eviction_check():
                 _watch_state.pop(path, None)
             continue
         log.info("evicting (unwatched %dd): %s", COLD_AFTER_DAYS, Path(path).name)
-        _metrics_evictions_total += 1
+        with _metrics_lock:
+            _metrics_evictions_total += 1
         # rclone VFS handles this — clearing the local cache entry triggers
         # the file to only exist on remote. We just need to drop it from VFS cache.
         try:
@@ -480,7 +568,7 @@ def _eviction_check():
         with _lock:
             _watch_state.pop(path, None)
     with _lock:
-        if to_evict:
+        if to_evict or invalid_paths:
             _save_state()
 
 
@@ -491,12 +579,15 @@ def _eviction_check():
 def jellyfin_webhook():
     """Handle Jellyfin playback webhook — prefetch rest of season or movie."""
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "request body must be an object"}), 400
     event = data.get("NotificationType", "")
     if event not in ("PlaybackStart",):
         return jsonify({"status": "ignored", "event": event})
 
     global _metrics_webhooks_total
-    _metrics_webhooks_total += 1
+    with _metrics_lock:
+        _metrics_webhooks_total += 1
 
     item_id = data.get("ItemId", "")
     if not item_id:
@@ -566,22 +657,30 @@ def plex_webhook():
         data = json.loads(payload)
     except json.JSONDecodeError:
         return jsonify({"status": "bad json"})
+    if not isinstance(data, dict):
+        return jsonify({"status": "bad json"}), 400
 
     event = data.get("event", "")
     if event not in ("media.play", "media.resume"):
         return jsonify({"status": "ignored"})
 
     global _metrics_webhooks_total
-    _metrics_webhooks_total += 1
+    with _metrics_lock:
+        _metrics_webhooks_total += 1
 
     metadata = data.get("Metadata", {})
+    if not isinstance(metadata, dict):
+        return jsonify({"error": "invalid metadata"}), 400
     media_type = metadata.get("type", "")
 
     # Episode — priority-prefetch current, background the rest
     if media_type == "episode":
         series_title = metadata.get("grandparentTitle", "")
-        season = int(metadata.get("parentIndex", 0))
-        episode_num = int(metadata.get("index", 0))
+        try:
+            season = int(metadata.get("parentIndex", 0))
+            episode_num = int(metadata.get("index", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid episode metadata"}), 400
         series = _resolve_sonarr_series(series_title)
         if not series:
             return jsonify({"status": "series not in sonarr"})
@@ -617,15 +716,21 @@ def tautulli_webhook():
         return jsonify({"status": "ignored", "event": event})
 
     global _metrics_webhooks_total
-    _metrics_webhooks_total += 1
+    with _metrics_lock:
+        _metrics_webhooks_total += 1
 
     metadata = data.get("Metadata", {})
+    if not isinstance(metadata, dict):
+        return jsonify({"error": "invalid metadata"}), 400
     media_type = metadata.get("type", "")
 
     if media_type == "episode":
         series_title = metadata.get("grandparentTitle", "")
-        season = int(metadata.get("parentIndex", 0))
-        episode_num = int(metadata.get("index", 0))
+        try:
+            season = int(metadata.get("parentIndex", 0))
+            episode_num = int(metadata.get("index", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid episode metadata"}), 400
         series = _resolve_sonarr_series(series_title)
         if not series:
             return jsonify({"status": "series not in sonarr"})
@@ -729,12 +834,15 @@ def cache_status():
     max_4k_streams = int(effective_uplink // STREAM_4K_MBPS)
     max_1080p_streams = int(effective_uplink // STREAM_1080P_MBPS)
 
+    with _prefetch_lock:
+        active_prefetch_count = len(_prefetch_active)
+
     return jsonify(
         {
             "cache_used_bytes": cache_bytes,
             "cache_max_gb": CACHE_MAX_GB,
             "cache_used_pct": round(cache_bytes / (CACHE_MAX_GB * 1073741824) * 100, 1) if CACHE_MAX_GB else 0,
-            "active_prefetch": len(_prefetch_active),
+            "active_prefetch": active_prefetch_count,
             "tracked_files": len(_watch_state),
             "cold_after_days": COLD_AFTER_DAYS,
             "bandwidth": {
@@ -820,26 +928,41 @@ def _update_union_remote():
 def add_backend():
     """Add an rclone remote via API (used by management UI)."""
     data = request.get_json(silent=True) or {}
-    remote_name = data.get("name", "").strip()
-    remote_type = data.get("type", "").strip()
+    if not isinstance(data, dict):
+        return jsonify({"error": "request body must be an object"}), 400
+    remote_name = data.get("name", "")
+    remote_type = data.get("type", "")
     params = data.get("params", {})
+    if not isinstance(remote_name, str) or not isinstance(remote_type, str):
+        return jsonify({"error": "name and type must be strings"}), 400
+    remote_name = remote_name.strip()
+    remote_type = remote_type.strip()
     if not remote_name or not remote_type:
         return jsonify({"error": "name and type required"}), 400
     if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$", remote_name):
         return jsonify({"error": "invalid remote name"}), 400
     if not re.match(r"^[a-z0-9]{1,32}$", remote_type):
         return jsonify({"error": "invalid remote type"}), 400
+    if not isinstance(params, dict):
+        return jsonify({"error": "params must be an object"}), 400
+    if len(params) > MAX_BACKEND_PARAMS:
+        return jsonify({"error": f"at most {MAX_BACKEND_PARAMS} params are allowed"}), 400
 
     # Validate param keys — prevent rclone flag injection
-    for k in params:
+    for k, value in params.items():
+        if not isinstance(k, str):
+            return jsonify({"error": "param keys must be strings"}), 400
         if not re.match(r"^[a-z][a-z0-9_]*$", k):
             return jsonify({"error": f"invalid param key: {k}"}), 400
-        if k.startswith("-"):
-            return jsonify({"error": "param keys must not start with -"}), 400
-    for v in params.values():
-        val = str(v)
+        if not isinstance(value, str | int | float | bool):
+            return jsonify({"error": f"invalid value type for param: {k}"}), 400
+        val = str(value)
+        if len(val) > MAX_BACKEND_PARAM_VALUE_LENGTH:
+            return jsonify({"error": f"param value is too long: {k}"}), 400
         if val.startswith("-"):
             return jsonify({"error": "param values must not start with -"}), 400
+        if any(character in val for character in ("\0", "\r", "\n")):
+            return jsonify({"error": f"param value contains control characters: {k}"}), 400
 
     cmd = ["rclone", "config", "create", remote_name, remote_type]
     for k, v in params.items():
@@ -852,12 +975,14 @@ def add_backend():
             timeout=30,
         )
         if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip()}), 500
+            log.warning("rclone rejected backend configuration for %s", remote_name)
+            return jsonify({"error": "rclone rejected the backend configuration"}), 502
         # Auto-join to union pool
         pool_ok = _update_union_remote()
         return jsonify({"status": "created", "remote": remote_name, "pool_updated": pool_ok})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except (OSError, subprocess.SubprocessError):
+        log.exception("rclone backend creation failed for %s", remote_name)
+        return jsonify({"error": "rclone backend creation failed"}), 502
 
 
 @app.route("/api/backends/rebuild-pool", methods=["POST"])
@@ -888,16 +1013,20 @@ def remove_backend():
             timeout=10,
         )
         if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip()}), 500
+            log.warning("rclone rejected backend removal for %s", remote_name)
+            return jsonify({"error": "rclone rejected the backend removal"}), 502
         _update_union_remote()
         return jsonify({"status": "removed", "remote": remote_name})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except (OSError, subprocess.SubprocessError):
+        log.exception("rclone backend removal failed for %s", remote_name)
+        return jsonify({"error": "rclone backend removal failed"}), 502
 
 
 @app.route("/api/active-prefetch")
 def active_prefetch():
-    return jsonify({"active": list(_prefetch_active)})
+    with _prefetch_lock:
+        active = sorted(_prefetch_active)
+    return jsonify({"active": active})
 
 
 @app.route("/api/watch-state")
@@ -908,6 +1037,10 @@ def watch_state_api():
 
 @app.route("/health")
 def health():
+    if not MEDIA_CACHE_TOKEN:
+        return jsonify({"status": "misconfigured", "detail": "administrative API token is missing"}), 503
+    if _scheduler is None or not _scheduler.running:
+        return jsonify({"status": "unavailable", "detail": "eviction scheduler is not running"}), 503
     return jsonify({"status": "ok"})
 
 
@@ -931,7 +1064,13 @@ def prometheus_metrics():
     with _lock:
         tracked = len(_watch_state)
         pinned = sum(1 for s in _watch_state.values() if s.get("pinned"))
-    active = len(_prefetch_active)
+    with _prefetch_lock:
+        active = len(_prefetch_active)
+    with _metrics_lock:
+        webhook_count = _metrics_webhooks_total
+        prefetch_started = _metrics_prefetch_started
+        prefetch_completed = _metrics_prefetch_completed
+        eviction_count = _metrics_evictions_total
     time_to_first_frame = (HEAD_BYTES * 8) / max(float(bandwidth["head_uplink_mbps"]) * 1_000_000, 1)
 
     lines = [
@@ -970,18 +1109,37 @@ def prometheus_metrics():
         f"media_cache_cold_after_days {COLD_AFTER_DAYS}",
         "# HELP media_cache_webhooks_total Total webhook events processed",
         "# TYPE media_cache_webhooks_total counter",
-        f"media_cache_webhooks_total {_metrics_webhooks_total}",
+        f"media_cache_webhooks_total {webhook_count}",
         "# HELP media_cache_prefetch_started_total Total prefetch operations started",
         "# TYPE media_cache_prefetch_started_total counter",
-        f"media_cache_prefetch_started_total {_metrics_prefetch_started}",
+        f"media_cache_prefetch_started_total {prefetch_started}",
         "# HELP media_cache_prefetch_completed_total Total prefetch operations completed",
         "# TYPE media_cache_prefetch_completed_total counter",
-        f"media_cache_prefetch_completed_total {_metrics_prefetch_completed}",
+        f"media_cache_prefetch_completed_total {prefetch_completed}",
         "# HELP media_cache_evictions_total Total files evicted to remote storage",
         "# TYPE media_cache_evictions_total counter",
-        f"media_cache_evictions_total {_metrics_evictions_total}",
+        f"media_cache_evictions_total {eviction_count}",
     ]
     return "\n".join(lines) + "\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+def _start_scheduler():
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        _eviction_check,
+        "interval",
+        hours=6,
+        id="eviction",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    scheduler.start()
+    return scheduler
+
+
+_scheduler = None
 
 
 def _init() -> None:
@@ -995,10 +1153,8 @@ def _init() -> None:
     _init._done = True  # type: ignore[attr-defined]
     _load_state()
     _load_throughput_samples()
-    scheduler = BackgroundScheduler()
-    # Run eviction check every 6 hours
-    scheduler.add_job(_eviction_check, "interval", hours=6, id="eviction")
-    scheduler.start()
+    global _scheduler
+    _scheduler = _start_scheduler()
 
 
 _init()
