@@ -3,9 +3,13 @@ set -eu
 
 container_id="$(
   docker run --detach --rm \
+    --cap-drop=ALL \
+    --read-only \
+    --security-opt=no-new-privileges:true \
     --tmpfs /cache \
     --tmpfs /library \
     --tmpfs /state \
+    --tmpfs /tmp \
     --env MEDIA_CACHE_TOKEN=smoke-test-token \
     media-cache:test
 )"

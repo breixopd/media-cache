@@ -8,3 +8,9 @@ dist/
 requirements-audit.txt
 *.egg-info/
 *.py[cod]
+.env
+.env.*
+!.env.example
+state/
+*.json.tmp
+*.json.corrupt-*

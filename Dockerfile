@@ -37,14 +37,21 @@ RUN apk add --no-cache ca-certificates curl tzdata unzip \
     && unzip /tmp/rclone.zip -d /tmp \
     && install -m 0755 "/tmp/rclone-${RCLONE_VERSION}-linux-${rclone_arch}/rclone" /usr/local/bin/rclone \
     && rm -rf /tmp/rclone.zip "/tmp/rclone-${RCLONE_VERSION}-linux-${rclone_arch}" \
-    && apk del unzip
+    && apk del unzip \
+    && addgroup -S media-cache \
+    && adduser -S -D -H -G media-cache media-cache \
+    && mkdir -p /app /cache /library /state \
+    && chown -R media-cache:media-cache /app /cache /library /state
 
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY app.py ./
 
+USER media-cache:media-cache
+
 VOLUME ["/state"]
 EXPOSE 8686
+STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -fsS http://localhost:8686/health >/dev/null || exit 1
-CMD ["gunicorn", "--bind", "0.0.0.0:8686", "--workers", "1", "--threads", "8", "--timeout", "120", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8686", "--workers", "1", "--threads", "8", "--timeout", "120", "--graceful-timeout", "30", "--worker-tmp-dir", "/tmp", "app:app"]
