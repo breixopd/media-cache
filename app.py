@@ -19,6 +19,7 @@ import re
 import subprocess  # nosec B404
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import median
@@ -71,6 +72,11 @@ def _set_security_headers(response):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.errorhandler(413)
+def _request_too_large(_error):
+    return jsonify({"error": "request body is too large"}), 413
 
 
 # --- Config ---
@@ -166,7 +172,9 @@ _metrics_lock = threading.Lock()
 _metrics_webhooks_total = 0
 _metrics_prefetch_started = 0
 _metrics_prefetch_completed = 0
+_metrics_prefetch_failed = 0
 _metrics_evictions_total = 0
+_metrics_eviction_failures = 0
 
 
 def _claim_prefetch(path: str) -> bool:
@@ -192,17 +200,45 @@ def _load_state() -> None:
             raw = json.load(f)
         if not isinstance(raw, dict):
             raise ValueError("watch state must be an object")
-        _watch_state = {path: state for path, state in raw.items() if isinstance(path, str) and isinstance(state, dict)}
-    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        loaded = {}
+        for path, state in raw.items():
+            if not isinstance(path, str) or not isinstance(state, dict):
+                continue
+            normalized = _translate_to_library(path)
+            if not normalized or not isinstance(state.get("last_watched"), str):
+                continue
+            if not isinstance(state.get("pinned", False), bool):
+                continue
+            loaded[normalized] = {
+                "last_watched": state["last_watched"],
+                "pinned": state.get("pinned", False),
+            }
+        _watch_state = loaded
+    except FileNotFoundError:
         _watch_state = {}
+    except (json.JSONDecodeError, OSError, ValueError):
+        _watch_state = {}
+        corrupt_path = f"{STATE_FILE}.corrupt-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}"
+        with suppress(OSError):
+            os.replace(STATE_FILE, corrupt_path)
+        log.exception("state file was invalid; quarantined as %s", corrupt_path)
 
 
 def _save_state() -> None:
     Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(_watch_state, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
     os.replace(tmp, STATE_FILE)
+    with suppress(OSError):
+        directory_fd = os.open(Path(STATE_FILE).parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def _load_throughput_samples() -> None:
@@ -229,8 +265,11 @@ def _load_throughput_samples() -> None:
 def _save_throughput_samples() -> None:
     Path(THROUGHPUT_STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
     tmp = THROUGHPUT_STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(_throughput_samples[-PREFETCH_SAMPLE_LIMIT:], f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
     os.replace(tmp, THROUGHPUT_STATE_FILE)
 
 
@@ -388,7 +427,7 @@ HEAD_BYTES = 100 * 1024 * 1024  # 100MB — enough for media server to start buf
 
 def _prefetch_full_file(path, claimed=False):
     """Read the entire file to pull it into rclone VFS cache."""
-    global _metrics_prefetch_completed
+    global _metrics_prefetch_completed, _metrics_prefetch_failed
     path = _translate_to_library(path)
     if not path:
         return
@@ -413,6 +452,8 @@ def _prefetch_full_file(path, claimed=False):
             _metrics_prefetch_completed += 1
         log.info("prefetched: %s", Path(path).name)
     except Exception as e:
+        with _metrics_lock:
+            _metrics_prefetch_failed += 1
         log.warning("prefetch failed: %s — %s", path, e)
     finally:
         _release_prefetch(path)
@@ -424,6 +465,7 @@ def _prefetch_priority_file(path):
     At 500Mbps this takes ~1.6 seconds for the head, and the media server
     can start playing while the remainder downloads.
     """
+    global _metrics_prefetch_failed
     path = _translate_to_library(path)
     if not path:
         return False
@@ -458,6 +500,8 @@ def _prefetch_priority_file(path):
         _prefetch_pool.submit(_prefetch_tail, path, read)
         return True
     except Exception as e:
+        with _metrics_lock:
+            _metrics_prefetch_failed += 1
         log.warning("priority prefetch failed: %s — %s", path, e)
         _release_prefetch(path)
         return False
@@ -465,6 +509,7 @@ def _prefetch_priority_file(path):
 
 def _prefetch_tail(path, offset):
     """Read remainder of file from offset (background continuation)."""
+    global _metrics_prefetch_failed
     started = perf_counter()
     try:
         bytes_read = 0
@@ -479,6 +524,8 @@ def _prefetch_tail(path, offset):
         _record_throughput(bytes_read, perf_counter() - started, "tail")
         log.info("prefetch complete: %s", Path(path).name)
     except Exception as e:
+        with _metrics_lock:
+            _metrics_prefetch_failed += 1
         log.warning("tail prefetch failed: %s — %s", path, e)
     finally:
         _release_prefetch(path)
@@ -537,7 +584,7 @@ def _eviction_check():
         for path in invalid_paths:
             _watch_state.pop(path, None)
 
-    global _metrics_evictions_total
+    global _metrics_evictions_total, _metrics_eviction_failures
     for path in to_evict:
         safe_path = _translate_to_library(path)
         if not safe_path:
@@ -550,10 +597,9 @@ def _eviction_check():
                 _watch_state.pop(path, None)
             continue
         log.info("evicting (unwatched %dd): %s", COLD_AFTER_DAYS, Path(path).name)
-        with _metrics_lock:
-            _metrics_evictions_total += 1
         # rclone VFS handles this — clearing the local cache entry triggers
         # the file to only exist on remote. We just need to drop it from VFS cache.
+        eviction_ok = True
         try:
             cache_path = Path(CACHE_DIR)
             # Remove the cached copy using the full relative path
@@ -563,10 +609,16 @@ def _eviction_check():
                 candidate.unlink()
                 log.info("evicted from cache: %s", candidate)
         except Exception as e:
+            eviction_ok = False
+            with _metrics_lock:
+                _metrics_eviction_failures += 1
             log.warning("eviction failed: %s — %s", path, e)
 
-        with _lock:
-            _watch_state.pop(path, None)
+        if eviction_ok:
+            with _metrics_lock:
+                _metrics_evictions_total += 1
+            with _lock:
+                _watch_state.pop(path, None)
     with _lock:
         if to_evict or invalid_paths:
             _save_state()
@@ -578,7 +630,7 @@ def _eviction_check():
 @app.route("/webhook/jellyfin", methods=["POST"])
 def jellyfin_webhook():
     """Handle Jellyfin playback webhook — prefetch rest of season or movie."""
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "request body must be an object"}), 400
     event = data.get("NotificationType", "")
@@ -710,7 +762,9 @@ def plex_webhook():
 @app.route("/webhook/tautulli", methods=["POST"])
 def tautulli_webhook():
     """Handle Tautulli playback webhook — same logic as Plex webhook."""
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "request body must be an object"}), 400
     event = data.get("event", "")
     if event not in ("play", "resume", "watched"):
         return jsonify({"status": "ignored", "event": event})
@@ -776,7 +830,9 @@ def _normalize_library_path(path: str) -> str | None:
 @app.route("/api/pin", methods=["POST"])
 def pin_file():
     """Pin a library file (e.g. while Tdarr transcodes) to prevent eviction."""
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "request body must be an object"}), 400
     path = _normalize_library_path(str(data.get("path", "")))
     if not path:
         return jsonify({"status": "error", "detail": "invalid path"}), 400
@@ -793,7 +849,9 @@ def pin_file():
 @app.route("/api/unpin", methods=["POST"])
 def unpin_file():
     """Clear transcode pin; eviction may proceed per cold_after_days."""
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "request body must be an object"}), 400
     path = _normalize_library_path(str(data.get("path", "")))
     if not path:
         return jsonify({"status": "error", "detail": "invalid path"}), 400
@@ -997,8 +1055,13 @@ def rebuild_pool():
 @app.route("/api/backends/remove", methods=["POST"])
 def remove_backend():
     """Remove an rclone remote and rebuild the union pool."""
-    data = request.get_json(silent=True) or {}
-    remote_name = data.get("name", "").strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "request body must be an object"}), 400
+    remote_name = data.get("name", "")
+    if not isinstance(remote_name, str):
+        return jsonify({"error": "name must be a string"}), 400
+    remote_name = remote_name.strip()
     if not remote_name:
         return jsonify({"error": "name required"}), 400
     if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$", remote_name):
@@ -1015,8 +1078,8 @@ def remove_backend():
         if result.returncode != 0:
             log.warning("rclone rejected backend removal for %s", remote_name)
             return jsonify({"error": "rclone rejected the backend removal"}), 502
-        _update_union_remote()
-        return jsonify({"status": "removed", "remote": remote_name})
+        pool_ok = _update_union_remote()
+        return jsonify({"status": "removed", "remote": remote_name, "pool_updated": pool_ok})
     except (OSError, subprocess.SubprocessError):
         log.exception("rclone backend removal failed for %s", remote_name)
         return jsonify({"error": "rclone backend removal failed"}), 502
@@ -1070,7 +1133,9 @@ def prometheus_metrics():
         webhook_count = _metrics_webhooks_total
         prefetch_started = _metrics_prefetch_started
         prefetch_completed = _metrics_prefetch_completed
+        prefetch_failed = _metrics_prefetch_failed
         eviction_count = _metrics_evictions_total
+        eviction_failures = _metrics_eviction_failures
     time_to_first_frame = (HEAD_BYTES * 8) / max(float(bandwidth["head_uplink_mbps"]) * 1_000_000, 1)
 
     lines = [
@@ -1116,9 +1181,15 @@ def prometheus_metrics():
         "# HELP media_cache_prefetch_completed_total Total prefetch operations completed",
         "# TYPE media_cache_prefetch_completed_total counter",
         f"media_cache_prefetch_completed_total {prefetch_completed}",
+        "# HELP media_cache_prefetch_failed_total Total prefetch operations that failed",
+        "# TYPE media_cache_prefetch_failed_total counter",
+        f"media_cache_prefetch_failed_total {prefetch_failed}",
         "# HELP media_cache_evictions_total Total files evicted to remote storage",
         "# TYPE media_cache_evictions_total counter",
         f"media_cache_evictions_total {eviction_count}",
+        "# HELP media_cache_eviction_failures_total Total cache eviction attempts that failed",
+        "# TYPE media_cache_eviction_failures_total counter",
+        f"media_cache_eviction_failures_total {eviction_failures}",
     ]
     return "\n".join(lines) + "\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
 

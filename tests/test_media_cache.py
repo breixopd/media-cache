@@ -122,6 +122,12 @@ class TestJellyfinWebhook:
         assert resp.status_code == 400
         assert resp.json == {"error": "request body must be an object"}
 
+    def test_rejects_empty_json_body(self, client):
+        resp = client.post("/webhook/jellyfin", data="not-json", content_type="application/json")
+
+        assert resp.status_code == 400
+        assert resp.json == {"error": "request body must be an object"}
+
     def test_ignores_non_playback(self, client):
         resp = client.post(
             "/webhook/jellyfin",
@@ -291,6 +297,17 @@ class TestBackendsAPI:
             )
         assert resp.status_code == 400
 
+    def test_remove_backend_rejects_non_object_body(self, client):
+        with patch.object(cache_app, "MEDIA_CACHE_TOKEN", "test-token"):
+            resp = client.post(
+                "/api/backends/remove",
+                json=["remote"],
+                headers={"X-Media-Cache-Token": "test-token"},
+            )
+
+        assert resp.status_code == 400
+        assert resp.json == {"error": "request body must be an object"}
+
     @pytest.mark.parametrize("params", [["not", "an", "object"], "provider=AWS", None])
     def test_add_backend_requires_parameter_object(self, client, params):
         with patch.object(cache_app, "MEDIA_CACHE_TOKEN", "test-token"):
@@ -356,6 +373,17 @@ class TestWatchState:
 
         assert cache_app._watch_state == {}
 
+    def test_load_state_quarantines_corrupt_json(self, tmp_path):
+        state_file = tmp_path / "state.json"
+        state_file.write_text("{not-json")
+
+        with patch.object(cache_app, "STATE_FILE", str(state_file)):
+            cache_app._load_state()
+
+        assert cache_app._watch_state == {}
+        assert not state_file.exists()
+        assert list(tmp_path.glob("state.json.corrupt-*"))
+
 
 class TestEviction:
     def test_eviction_skips_pinned(self):
@@ -385,6 +413,30 @@ class TestEviction:
             cache_app._eviction_check()
 
         assert "/library/broken.mkv" not in cache_app._watch_state
+
+    def test_eviction_keeps_state_when_cache_delete_fails(self, tmp_path):
+        library = tmp_path / "library"
+        cache = tmp_path / "cache"
+        media = library / "movie.mkv"
+        cached = cache / "movie.mkv"
+        library.mkdir()
+        cache.mkdir()
+        media.write_bytes(b"library")
+        cached.write_bytes(b"cached")
+        cache_app._watch_state = {
+            str(media): {"last_watched": "2020-01-01T00:00:00+00:00", "pinned": False},
+        }
+
+        with (
+            patch.object(cache_app, "LIBRARY_DIR", str(library)),
+            patch.object(cache_app, "CACHE_DIR", str(cache)),
+            patch.object(cache_app, "_save_state"),
+            patch.object(type(cached), "unlink", side_effect=OSError("busy")),
+        ):
+            cache_app._eviction_check()
+
+        assert str(media) in cache_app._watch_state
+        assert cached.exists()
 
 
 class TestPrefetchCoordination:
