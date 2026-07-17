@@ -10,7 +10,7 @@ Sonarr, and Radarr integrations supply playback and library context.
 Release images are published for `linux/amd64` and `linux/arm64`:
 
 ```text
-ghcr.io/breixopd/media-cache:v1.0.0
+ghcr.io/breixopd/media-cache:v1.1.0
 ```
 
 Use a release digest in production. The Homelab Toolkit service plugin owns the

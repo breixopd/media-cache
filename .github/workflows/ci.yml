@@ -53,6 +53,11 @@ jobs:
         run: uv run python -m compileall -q app.py tests
       - name: Check diff hygiene
         run: git diff --check
+      - name: Validate release image tag contract
+        run: |
+          grep -Fq 'DOCKER_METADATA_SHORT_SHA_LENGTH: 40' .github/workflows/release.yml
+          grep -Fq 'type=sha,prefix=sha-' .github/workflows/release.yml
+          ! grep -Fq 'type=raw,value=latest' .github/workflows/release.yml
       - name: Audit dependencies
         run: |
           uv export --locked --no-dev --no-emit-project --format requirements-txt --output-file requirements-audit.txt

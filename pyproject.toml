@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "homelab-media-cache"
-version = "1.0.0"
+version = "1.1.0"
 description = "Playback-aware cache promotion and storage tiering service"
 readme = "README.md"
 license = "AGPL-3.0-only"
