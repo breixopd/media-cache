@@ -284,8 +284,12 @@ class TestBackendsAPI:
                 content_type="application/json",
                 headers={"X-Media-Cache-Token": "test-token"},
             )
-        assert resp.status_code == 200
-        assert resp.json["status"] == "created"
+        assert resp.status_code == 501
+        assert resp.json == {
+            "error": "backend configuration is deployment-owned",
+            "detail": "configure rclone through the parent deployment controller",
+        }
+        mock_run.assert_not_called()
 
     def test_add_backend_requires_fields(self, client):
         with patch.object(cache_app, "MEDIA_CACHE_TOKEN", "test-token"):
@@ -351,9 +355,20 @@ class TestBackendsAPI:
                 headers={"X-Media-Cache-Token": "test-token"},
             )
 
-        assert resp.status_code == 502
-        assert resp.json == {"error": "rclone rejected the backend configuration"}
-        assert b"leaked" not in resp.data
+        assert resp.status_code == 501
+        assert resp.json["error"] == "backend configuration is deployment-owned"
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize("path", ["/api/backends/remove", "/api/backends/rebuild-pool"])
+    @patch("subprocess.run")
+    def test_backend_mutations_never_invoke_rclone(self, mock_run, client, path):
+        with patch.object(cache_app, "MEDIA_CACHE_TOKEN", "test-token"):
+            payload = {"name": "remote"} if path.endswith("remove") else None
+            resp = client.post(path, json=payload, headers={"X-Media-Cache-Token": "test-token"})
+
+        assert resp.status_code == 501
+        assert resp.json["error"] == "backend configuration is deployment-owned"
+        mock_run.assert_not_called()
 
 
 class TestWatchState:

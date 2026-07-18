@@ -37,10 +37,10 @@ MAX_BACKEND_PARAMS = 32
 MAX_BACKEND_PARAM_VALUE_LENGTH = 4096
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
 
-# Shared-secret guard for mutating/admin endpoints. The backend-add endpoint accepts
-# rclone credentials, so a missing token is a service configuration error rather than
-# an authentication bypass. Webhooks, health, metrics, and read-only GETs remain open
-# to media services on the internal network.
+# Shared-secret guard for mutating/admin endpoints. Pin/unpin remain service-owned;
+# legacy backend mutation paths retain the guard while returning an explicit
+# deployment-ownership error. Webhooks, health, metrics, and read-only GETs remain
+# open to media services on the internal network.
 MEDIA_CACHE_TOKEN = os.getenv("MEDIA_CACHE_TOKEN", "")
 _PROTECTED_ENDPOINTS = frozenset(
     {
@@ -930,61 +930,21 @@ def list_backends():
     return jsonify({"backends": remotes})
 
 
-def _update_union_remote():
-    """Rebuild the media-union remote to include all non-union backends."""
-    try:
-        result = subprocess.run(  # nosec B603 B607
-            ["rclone", "listremotes"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            log.warning("union rebuild: failed to list remotes")
-            return False
-        all_remotes = [r.rstrip(":") for r in result.stdout.strip().split("\n") if r.strip()]
-        # Exclude the union remote itself and any empty names
-        upstreams = [r for r in all_remotes if r and r != RCLONE_REMOTE]
-        if not upstreams:
-            log.info("union rebuild: no backends to join")
-            return True
-        # Format: "remote1: remote2: remote3:" (space-separated, colon-suffixed)
-        upstreams_str = " ".join(f"{r}:" for r in upstreams)
-        # Create/update the union remote
-        cmd = [
-            "rclone",
-            "config",
-            "create",
-            RCLONE_REMOTE,
-            "union",
-            "upstreams",
-            upstreams_str,
-            "action_policy",
-            "all",
-            "create_policy",
-            "all",
-            "search_policy",
-            "all",
-        ]
-        rebuild = subprocess.run(  # nosec B603 B607
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if rebuild.returncode == 0:
-            log.info("union rebuild: %s now unions %s", RCLONE_REMOTE, upstreams)
-            return True
-        log.warning("union rebuild failed: %s", rebuild.stderr.strip())
-        return False
-    except Exception as e:
-        log.warning("union rebuild error: %s", e)
-        return False
+def _backend_mutation_unavailable():
+    return (
+        jsonify(
+            {
+                "error": "backend configuration is deployment-owned",
+                "detail": "configure rclone through the parent deployment controller",
+            }
+        ),
+        501,
+    )
 
 
 @app.route("/api/backends/add", methods=["POST"])
 def add_backend():
-    """Add an rclone remote via API (used by management UI)."""
+    """Reject legacy backend mutation requests owned by the deployment controller."""
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return jsonify({"error": "request body must be an object"}), 400
@@ -1022,39 +982,18 @@ def add_backend():
         if any(character in val for character in ("\0", "\r", "\n")):
             return jsonify({"error": f"param value contains control characters: {k}"}), 400
 
-    cmd = ["rclone", "config", "create", remote_name, remote_type]
-    for k, v in params.items():
-        cmd.extend([k, str(v)])
-    try:
-        result = subprocess.run(  # nosec B603 B607
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            log.warning("rclone rejected backend configuration for %s", remote_name)
-            return jsonify({"error": "rclone rejected the backend configuration"}), 502
-        # Auto-join to union pool
-        pool_ok = _update_union_remote()
-        return jsonify({"status": "created", "remote": remote_name, "pool_updated": pool_ok})
-    except (OSError, subprocess.SubprocessError):
-        log.exception("rclone backend creation failed for %s", remote_name)
-        return jsonify({"error": "rclone backend creation failed"}), 502
+    return _backend_mutation_unavailable()
 
 
 @app.route("/api/backends/rebuild-pool", methods=["POST"])
 def rebuild_pool():
-    """Manually rebuild the union remote from all configured backends."""
-    ok = _update_union_remote()
-    if ok:
-        return jsonify({"status": "rebuilt"})
-    return jsonify({"error": "rebuild failed"}), 500
+    """Reject legacy union rebuild requests owned by the deployment controller."""
+    return _backend_mutation_unavailable()
 
 
 @app.route("/api/backends/remove", methods=["POST"])
 def remove_backend():
-    """Remove an rclone remote and rebuild the union pool."""
+    """Reject legacy backend removal requests owned by the deployment controller."""
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "request body must be an object"}), 400
@@ -1068,21 +1007,7 @@ def remove_backend():
         return jsonify({"error": "invalid remote name"}), 400
     if remote_name == RCLONE_REMOTE:
         return jsonify({"error": "cannot remove the union remote itself"}), 400
-    try:
-        result = subprocess.run(  # nosec B603 B607
-            ["rclone", "config", "delete", remote_name],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            log.warning("rclone rejected backend removal for %s", remote_name)
-            return jsonify({"error": "rclone rejected the backend removal"}), 502
-        pool_ok = _update_union_remote()
-        return jsonify({"status": "removed", "remote": remote_name, "pool_updated": pool_ok})
-    except (OSError, subprocess.SubprocessError):
-        log.exception("rclone backend removal failed for %s", remote_name)
-        return jsonify({"error": "rclone backend removal failed"}), 502
+    return _backend_mutation_unavailable()
 
 
 @app.route("/api/active-prefetch")

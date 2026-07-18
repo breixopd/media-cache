@@ -43,7 +43,7 @@ eviction scheduler is running. The supported operational variables are:
 | `THROUGHPUT_STATE_FILE` | `/state/throughput_samples.json` | Durable bandwidth samples |
 | `CACHE_MAX_GB` | `500` | Capacity reported to operators |
 | `COLD_AFTER_DAYS` | `15` | Age before an unpinned tracked file is evicted |
-| `RCLONE_REMOTE` | `media-union` | Union remote rebuilt by backend management |
+| `RCLONE_REMOTE` | `media-union` | Union remote selected by the deployment-owned rclone configuration |
 | `UPLINK_MBPS` | auto | Manual uplink override; `0` enables observation/link detection |
 
 `SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY`, `JELLYFIN_URL`,
@@ -56,9 +56,15 @@ These paths and response shapes are the stable v1 contract consumed by the
 Homelab Toolkit service plugin. `GET /health` is the readiness check, `GET
 /api/status` is the operator status document, `GET /api/backends` lists rclone
 remotes, `GET /api/active-prefetch` and `GET /api/watch-state` expose live state,
-and `GET /metrics` exposes Prometheus text-format metrics. Mutating API requests
-(`POST /api/pin`, `/api/unpin`, `/api/backends/add`, `/api/backends/remove`, and
-`/api/backends/rebuild-pool`) require the `X-Media-Cache-Token` header.
+and `GET /metrics` exposes Prometheus text-format metrics. Pin and unpin requests
+(`POST /api/pin` and `/api/unpin`) require the `X-Media-Cache-Token` header.
+
+The rclone configuration is deployment-owned and mounted read-only at
+`/config/rclone`. Media Cache never writes backend credentials or union settings;
+the legacy backend mutation paths return `501` with an explicit controller-owned
+error so callers cannot mistake a failed write for a successful reconciliation.
+Use the parent deployment controller to update rclone configuration, then restart
+or reload the rclone mount as required by that deployment.
 
 `POST /webhook/jellyfin`, `POST /webhook/plex`, and `POST /webhook/tautulli`
 retain their playback-event behavior. Jellyfin receives JSON playback events;
@@ -93,7 +99,7 @@ attaches a GitHub artifact attestation. There is intentionally no floating
 `latest` tag.
 
 The image runs as an unprivileged `media-cache` user with all Linux capabilities
-dropped in the smoke test. Production deployments should keep `/config/rclone`
+dropped in the smoke test. Production deployments must keep `/config/rclone`
 read-only, provide only the three documented storage mounts, use a digest-pinned
 GHCR image, and restrict network access to the media services, operator plane,
 and Prometheus scraper that need it.
