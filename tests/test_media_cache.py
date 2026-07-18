@@ -96,6 +96,17 @@ class TestLibraryPaths:
             assert cache_app._translate_to_library("/data/movies/film.mkv") == "/library/movies/film.mkv"
 
     @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            ("/data/movies/film.mkv", "/library/movies/film.mkv"),
+            ("/data/tv/show/episode.mkv", "/library/tv/show/episode.mkv"),
+        ],
+    )
+    def test_normalizes_arr_paths_for_pin_operations(self, path, expected):
+        with patch.object(cache_app, "LIBRARY_DIR", "/library"):
+            assert cache_app._normalize_library_path(path) == expected
+
+    @pytest.mark.parametrize(
         "path",
         [
             "/data/movies/../../etc/passwd",
@@ -378,6 +389,21 @@ class TestWatchState:
         resp = client.get("/api/watch-state")
         assert resp.json["files"] >= 1
         assert "/library/test/file.mkv" in resp.json["state"]
+
+    def test_pin_accepts_arr_namespace_path(self, client):
+        with (
+            patch.object(cache_app, "MEDIA_CACHE_TOKEN", "test-token"),
+            patch.object(cache_app, "LIBRARY_DIR", "/library"),
+            patch.object(cache_app, "_save_state"),
+        ):
+            resp = client.post(
+                "/api/pin",
+                json={"path": "/data/movies/film.mkv"},
+                headers={"X-Media-Cache-Token": "test-token"},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json["path"] == "/library/movies/film.mkv"
 
     def test_load_state_discards_invalid_shape(self, tmp_path):
         state_file = tmp_path / "state.json"

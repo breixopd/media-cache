@@ -811,9 +811,16 @@ def tautulli_webhook():
 
 
 def _normalize_library_path(path: str) -> str | None:
-    """Resolve path under LIBRARY_DIR for pin/unpin."""
+    """Resolve an integration path under LIBRARY_DIR for pin/unpin."""
     if not path:
         return None
+
+    # Sonarr, Radarr, and Tdarr use the shared /data namespace while this
+    # service sees that same tree at LIBRARY_DIR (/library in the deployment).
+    translated = _translate_to_library(path)
+    if translated:
+        return translated
+
     candidate = Path(path)
     if not candidate.is_absolute():
         candidate = Path(LIBRARY_DIR) / path

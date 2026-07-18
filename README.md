@@ -58,6 +58,8 @@ Homelab Toolkit service plugin. `GET /health` is the readiness check, `GET
 remotes, `GET /api/active-prefetch` and `GET /api/watch-state` expose live state,
 and `GET /metrics` exposes Prometheus text-format metrics. Pin and unpin requests
 (`POST /api/pin` and `/api/unpin`) require the `X-Media-Cache-Token` header.
+Their `path` accepts either the service's `/library/...` namespace or the shared
+media stack's `/data/...` namespace; both are normalized under `LIBRARY_DIR`.
 
 The rclone configuration is deployment-owned and mounted read-only at
 `/config/rclone`. Media Cache never writes backend credentials or union settings;
